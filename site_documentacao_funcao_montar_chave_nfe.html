@@ -1,0 +1,169 @@
+
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <title>Documentação Técnica - montar_chave_nfe</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; background: #f9f9f9; color: #2c3e50; }
+        header { background: #34495e; color: #fff; padding: 20px; text-align: center; }
+        nav { background: #2c3e50; padding: 10px; }
+        nav a { color: #ecf0f1; margin: 0 10px; text-decoration: none; font-weight: bold; }
+        main { padding: 20px; }
+        section { margin-bottom: 40px; }
+        pre { background: #ecf0f1; padding: 15px; border-radius: 10px; overflow-x: auto; }
+        code { color: #c0392b; }
+        footer { background: #bdc3c7; text-align: center; padding: 10px; }
+        ul li { margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Documentação Técnica</h1>
+        <h2>Função: montar_chave_nfe (PostgreSQL 14)</h2>
+    </header>
+    <nav>
+        <a href="#descricao">Descrição</a>
+        <a href="#recursos">Recursos</a>
+        <a href="#codigo">Código</a>
+        <a href="#exemplo">Exemplo</a>
+    </nav>
+    <main>
+        <section id="descricao">
+            <h2>Descrição</h2>
+            <p>Função PL/pgSQL responsável pela geração da chave de acesso da NFe, com validações completas, tratamento de entrada e cálculo do dígito verificador (DV).</p>
+        </section>
+
+        <section id="recursos">
+            <h2>Recursos e Validações</h2>
+            <ul>
+                <li>💬 <strong>RAISE NOTICE</strong> para log dos parâmetros</li>
+                <li>🧼 Limpeza do CNPJ com <code>REGEXP_REPLACE</code></li>
+                <li>🛡️ Validação do código da UF com base na Receita Federal</li>
+                <li>📆 Validação do AAMM (formato, mês válido, mês atual)</li>
+                <li>⚠️ Validação do tipo de emissão com <code>USING HINT</code></li>
+                <li>🔢 Validação de comprimento e formato de todos os campos</li>
+                <li>🧮 Cálculo do DV via módulo 11 com pesos cíclicos [2–9]</li>
+            </ul>
+        </section>
+
+        <section id="codigo">
+            <h2>Código da Função</h2>
+            <pre><code>CREATE OR REPLACE FUNCTION public.funcao_montar_chave_nfe(
+    p_cuf TEXT,
+    p_ano_mes TEXT,
+    p_cnpj TEXT,
+    p_modelo TEXT,
+    p_serie TEXT,
+    p_numero TEXT,
+    p_tp_emis TEXT,
+    p_codigo_numerico TEXT
+) RETURNS TEXT AS
+$$
+DECLARE
+    chave_sem_dv TEXT;
+    dv INT;
+    chave_final TEXT;
+    pesos INT[] := ARRAY[2,3,4,5,6,7,8,9];
+    soma INT := 0;
+    i INT;
+    digito INT;
+    mes_int INT;
+    aammdatual TEXT := TO_CHAR(CURRENT_DATE, 'YYMM');
+    ufs_validas INT[] := ARRAY[
+        12, 27, 13, 16, 29, 23, 53, 32, 52, 21, 31, 50, 51,
+        15, 25, 26, 22, 41, 33, 24, 43, 11, 14, 42, 28, 35, 17
+    ];
+    cnpj_limpo TEXT;
+BEGIN
+    RAISE NOTICE 'Parametros recebidos -> cUF: %, ano_mes: %, cnpj: %, modelo: %, serie: %, numero: %, tp_emis: %, codigo_numerico: %',
+        p_cuf, p_ano_mes, p_cnpj, p_modelo, p_serie, p_numero, p_tp_emis, p_codigo_numerico;
+
+    cnpj_limpo := REGEXP_REPLACE(p_cnpj, '\D', '', 'g');
+
+    IF p_cuf !~ '^\d{1,2}$' OR p_cuf::INT NOT IN (SELECT unnest(ufs_validas)) THEN
+        RAISE EXCEPTION 'Código UF inválido (%): deve ser um dos códigos oficiais da Receita Federal', p_cuf;
+    END IF;
+
+    IF p_tp_emis IS NULL OR p_tp_emis NOT IN ('1','2','3','4','5','6','7','8','9') THEN
+        RAISE EXCEPTION 'Tipo de emissão inválido: %, deve estar entre 1 e 9 conforme padrão SEFAZ', p_tp_emis
+        USING HINT = 'Valores válidos: 1-Normal, 2-FS, 3-SCAN, 4-DPEC, 5-FSDA, 6-SVC-AN, 7-SVC-RS, 8-offline NFCe, 9-contingência NFCe';
+    END IF;
+
+    IF LENGTH(p_ano_mes) <> 4 OR p_ano_mes !~ '^\d{4}$' THEN
+        RAISE EXCEPTION 'Ano/Mês inválido: deve ter 4 dígitos no formato AAMM';
+    END IF;
+
+    mes_int := CAST(SUBSTRING(p_ano_mes, 3, 2) AS INTEGER);
+    IF mes_int < 1 OR mes_int > 12 THEN
+        RAISE EXCEPTION 'Mês inválido em AAMM (%): deve estar entre 01 e 12', p_ano_mes;
+    END IF;
+
+    IF p_ano_mes <> aammdatual THEN
+        RAISE EXCEPTION 'AAMM informado (%), diferente do AAMM atual (%)', p_ano_mes, aammdatual;
+    END IF;
+
+    IF LENGTH(p_modelo) <> 2 OR p_modelo !~ '^\d{2}$' THEN
+        RAISE EXCEPTION 'Modelo inválido: deve ter 2 dígitos';
+    END IF;
+
+    IF LENGTH(p_serie) > 3 OR p_serie !~ '^\d{1,3}$' THEN
+        RAISE EXCEPTION 'Série inválida: deve ter até 3 dígitos';
+    END IF;
+
+    IF LENGTH(p_numero) > 9 OR p_numero !~ '^\d{1,9}$' THEN
+        RAISE EXCEPTION 'Número inválido: deve ter até 9 dígitos';
+    END IF;
+
+    IF LENGTH(p_tp_emis) <> 1 OR p_tp_emis !~ '^\d{1}$' THEN
+        RAISE EXCEPTION 'Tipo de emissão inválido: deve ter 1 dígito';
+    END IF;
+
+    IF LENGTH(p_codigo_numerico) <> 8 OR p_codigo_numerico !~ '^\d{8}$' THEN
+        RAISE EXCEPTION 'Código numérico inválido: deve ter 8 dígitos';
+    END IF;
+
+    chave_sem_dv := LPAD(p_cuf, 2, '0') ||
+                    LPAD(p_ano_mes, 4, '0') ||
+                    LPAD(cnpj_limpo, 14, '0') ||
+                    LPAD(p_modelo, 2, '0') ||
+                    LPAD(p_serie, 3, '0') ||
+                    LPAD(p_numero, 9, '0') ||
+                    LPAD(p_tp_emis, 1, '0') ||
+                    LPAD(p_codigo_numerico, 8, '0');
+
+    FOR i IN REVERSE LENGTH(chave_sem_dv)..1 LOOP
+        digito := CAST(SUBSTRING(chave_sem_dv, i, 1) AS INTEGER);
+        soma := soma + digito * pesos[((LENGTH(chave_sem_dv) - i) % 8) + 1];
+    END LOOP;
+
+    dv := 11 - (soma % 11);
+    IF dv >= 10 THEN
+        dv := 0;
+    END IF;
+
+    chave_final := chave_sem_dv || dv;
+    RETURN chave_final;
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+        </section>
+
+        <section id="exemplo">
+            <h2>Exemplo de Uso</h2>
+            <pre><code>SELECT funcao_montar_chave_nfe(
+    '35',
+    TO_CHAR(CURRENT_DATE, 'YYMM'),
+    '12.345.678/0001-95',
+    '55',
+    '1',
+    '1234',
+    '1',
+    '87654321'
+);</code></pre>
+        </section>
+    </main>
+    <footer>
+        Desenvolvido por Cezar • PostgreSQL 14 • 2025
+    </footer>
+</body>
+</html>
